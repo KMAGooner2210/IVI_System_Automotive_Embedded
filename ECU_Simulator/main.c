@@ -1,20 +1,23 @@
 #include "stm32f10x.h"
 #include <stdio.h>
+#include <stdlib.h>
 
-#define FILTER_DEPTH 8 
+/* Bộ đệm nhận dữ liệu ADC qua DMA */
+volatile uint16_t adc_buffer[2];
 
-volatile uint16_t ADC_Values[2];
-volatile uint8_t  flag_50ms    = 0;
-volatile uint32_t msTicks      = 0;
-volatile uint8_t  turn_left    = 0;
-volatile uint8_t  turn_right   = 0;
-volatile uint8_t  flag_turn    = 0;
-volatile uint8_t  can_tx_status = 0;
+/* Các cờ báo hiệu trạng thái (System Flags) */
+volatile uint8_t  flag_cycle_50ms     = 0;
+volatile uint8_t  flag_turn_signal    = 0;
 
+/* Thời gian hệ thống (System Tick trong SysTick_Handler) */
+volatile uint32_t sys_time_ms         = 0;
 
-uint16_t speed_buffer[FILTER_DEPTH] = {0};
-uint16_t rpm_buffer[FILTER_DEPTH]   = {0};
-uint8_t  filter_index = 0;
+/* Trạng thái xi-nhan xe */
+volatile uint8_t  signal_left         = 0;
+volatile uint8_t  signal_right        = 0;
+
+/* Kết quả truyền thông CAN Bus */
+volatile uint8_t  can_transmit_result = 0;
 
 #pragma import(__use_no_semihosting)
 struct __FILE { int handle; };
@@ -28,7 +31,7 @@ int fputc(int ch, FILE *f) {
 }
 
 void SysTick_Init(void) { if (SysTick_Config(SystemCoreClock / 1000)) { while (1); } }
-void SysTick_Handler(void) { msTicks++; }
+void SysTick_Handler(void) { sys_time_ms++; }
 
 void Hardware_GPIO_Config(void) {
     GPIO_InitTypeDef GPIO_InitStructure;
@@ -38,16 +41,15 @@ void Hardware_GPIO_Config(void) {
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_CAN1 | RCC_APB1Periph_TIM3, ENABLE);
     RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
 
-    /* USART1 TX � PA9 */
+    /* USART1 TX — PA9 */
     GPIO_InitStructure.GPIO_Pin   = GPIO_Pin_9;
     GPIO_InitStructure.GPIO_Mode  = GPIO_Mode_AF_PP;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
-    /* USART1 RX � PA10 */
+    /* USART1 RX — PA10 */
     GPIO_InitStructure.GPIO_Pin  = GPIO_Pin_10;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
-
 
     GPIO_PinRemapConfig(GPIO_Remap1_CAN1, ENABLE);
 	
@@ -60,7 +62,6 @@ void Hardware_GPIO_Config(void) {
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOB, &GPIO_InitStructure);
 
-
     GPIO_InitStructure.GPIO_Pin  = GPIO_Pin_12 | GPIO_Pin_13;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(GPIOB, &GPIO_InitStructure);
@@ -68,7 +69,6 @@ void Hardware_GPIO_Config(void) {
 
 void UART_Config(void) {
     USART_InitTypeDef USART_InitStructure;
-
     USART_InitStructure.USART_BaudRate            = 115200; 
     USART_InitStructure.USART_WordLength          = USART_WordLength_8b;
     USART_InitStructure.USART_StopBits            = USART_StopBits_1;
@@ -85,9 +85,7 @@ void CAN_Config(void) {
 
     CAN_DeInit(CAN1);
     CAN_StructInit(&CAN_InitStructure);
-
     CAN_InitStructure.CAN_TTCM = DISABLE;
-
     CAN_InitStructure.CAN_ABOM = ENABLE;
     CAN_InitStructure.CAN_AWUM = DISABLE;
     CAN_InitStructure.CAN_NART = DISABLE;
@@ -100,14 +98,11 @@ void CAN_Config(void) {
     CAN_InitStructure.CAN_BS2        = CAN_BS2_3tq;
     CAN_InitStructure.CAN_Prescaler  = 4; /* APB1=36MHz, 36/4/18TQ = 500kbps */
 
-
     uint8_t can_init_result = CAN_Init(CAN1, &CAN_InitStructure);
     if (can_init_result != CAN_InitStatus_Success) {
-        printf("[CAN] Init FAILED (status=%d). Kiem tra SN65HVD230 va ket noi bus.\r\n",
-               can_init_result);
+        printf("[CAN] Init FAILED (status=%d).\r\n", can_init_result);
     }
 
-    /* B? l?c pass-all nh?n m?i ID */
     CAN_FilterInitStructure.CAN_FilterNumber         = 0;
     CAN_FilterInitStructure.CAN_FilterMode           = CAN_FilterMode_IdMask;
     CAN_FilterInitStructure.CAN_FilterScale          = CAN_FilterScale_32bit;
@@ -125,15 +120,13 @@ void ADC_DMA_Config(void) {
     DMA_InitTypeDef  DMA_InitStructure;
     GPIO_InitTypeDef GPIO_InitStructure;
 
-    /* PA0, PA1 � Analog Input */
     GPIO_InitStructure.GPIO_Pin  = GPIO_Pin_0 | GPIO_Pin_1;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    /* DMA1 Channel1 */
     DMA_DeInit(DMA1_Channel1);
     DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&ADC1->DR;
-    DMA_InitStructure.DMA_MemoryBaseAddr     = (uint32_t)ADC_Values;
+    DMA_InitStructure.DMA_MemoryBaseAddr     = (uint32_t)adc_buffer;
     DMA_InitStructure.DMA_DIR                = DMA_DIR_PeripheralSRC;
     DMA_InitStructure.DMA_BufferSize         = 2;
     DMA_InitStructure.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
@@ -146,7 +139,6 @@ void ADC_DMA_Config(void) {
     DMA_Init(DMA1_Channel1, &DMA_InitStructure);
     DMA_Cmd(DMA1_Channel1, ENABLE);
 
-    /* ADC1 */
     ADC_InitStructure.ADC_Mode               = ADC_Mode_Independent;
     ADC_InitStructure.ADC_ScanConvMode       = ENABLE;
     ADC_InitStructure.ADC_ContinuousConvMode = ENABLE;
@@ -169,8 +161,8 @@ void TIMER3_Config(void) {
     TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
     NVIC_InitTypeDef        NVIC_InitStructure;
 
-    TIM_TimeBaseStructure.TIM_Prescaler   = 7200 - 1;
-    TIM_TimeBaseStructure.TIM_Period      = 500  - 1; // 50ms
+    TIM_TimeBaseStructure.TIM_Prescaler     = 7200 - 1;
+    TIM_TimeBaseStructure.TIM_Period        = 500  - 1; // 50ms
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
     TIM_TimeBaseStructure.TIM_CounterMode   = TIM_CounterMode_Up;
     TIM_TimeBaseInit(TIM3, &TIM_TimeBaseStructure);
@@ -213,7 +205,7 @@ void CAN_Send_Speed(uint8_t speed_value) {
     TxMessage.DLC      = 8;
     TxMessage.Data[0]  = speed_value;
     for (int i = 1; i < 8; i++) TxMessage.Data[i] = 0x00;
-    can_tx_status = CAN_Transmit(CAN1, &TxMessage);
+    can_transmit_result = CAN_Transmit(CAN1, &TxMessage);
 }
 
 void CAN_Send_RPM(uint16_t rpm_value) {
@@ -226,7 +218,7 @@ void CAN_Send_RPM(uint16_t rpm_value) {
     TxMessage.Data[1] = (uint8_t)(rpm_value & 0xFF);
     for (int i = 2; i < 8; i++) TxMessage.Data[i] = 0x00;
     uint8_t s = CAN_Transmit(CAN1, &TxMessage);
-    if (s == CAN_TxStatus_NoMailBox) can_tx_status = s;
+    if (s == CAN_TxStatus_NoMailBox) can_transmit_result = s;
 }
 
 void CAN_Send_TurnSignal(uint8_t left, uint8_t right) {
@@ -238,21 +230,13 @@ void CAN_Send_TurnSignal(uint8_t left, uint8_t right) {
     TxMessage.Data[0] = left;
     TxMessage.Data[1] = right;
     uint8_t s = CAN_Transmit(CAN1, &TxMessage);
-    if (s == CAN_TxStatus_NoMailBox) can_tx_status = s;
-}
-
-
-uint16_t Update_Filter(uint16_t *buffer, uint16_t new_val) {
-    uint32_t sum = 0;
-    buffer[filter_index] = new_val;
-    for (int i = 0; i < FILTER_DEPTH; i++) { sum += buffer[i]; }
-    return (uint16_t)(sum / FILTER_DEPTH);
+    if (s == CAN_TxStatus_NoMailBox) can_transmit_result = s;
 }
 
 void TIM3_IRQHandler(void) {
     if (TIM_GetITStatus(TIM3, TIM_IT_Update) != RESET) {
         TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
-        flag_50ms = 1;
+        flag_cycle_50ms = 1;
     }
 }
 
@@ -262,33 +246,78 @@ void EXTI15_10_IRQHandler(void) {
 
     if (EXTI_GetITStatus(EXTI_Line12) != RESET) {
         EXTI_ClearITPendingBit(EXTI_Line12);
-        if (msTicks - last_press_PB12 >= 300) {
-            last_press_PB12 = msTicks;
-            turn_left  = 1;
-            turn_right = 0;
-            flag_turn  = 1;
-   
+        if (sys_time_ms - last_press_PB12 >= 300) {
+            last_press_PB12  = sys_time_ms;
+            signal_left      = 1;
+            signal_right     = 0;
+            flag_turn_signal = 1;
         }
     }
     if (EXTI_GetITStatus(EXTI_Line13) != RESET) {
         EXTI_ClearITPendingBit(EXTI_Line13);
-        if (msTicks - last_press_PB13 >= 300) {
-            last_press_PB13 = msTicks;
-            turn_left  = 0;
-            turn_right = 1;
-            flag_turn  = 1;
-     
+        if (sys_time_ms - last_press_PB13 >= 300) {
+            last_press_PB13  = sys_time_ms;
+            signal_left      = 0;
+            signal_right     = 1;
+            flag_turn_signal = 1;
         }
     }
 }
 
-int main(void) {
-    uint8_t  real_speed    = 0;
-    uint16_t real_rpm      = 0;
-    uint8_t  print_counter = 0;
-    uint16_t raw_speed     = 0;
-    uint16_t raw_rpm       = 0;
+void Process_Turn_Signal(void) {
+    __disable_irq();
+    uint8_t local_left  = signal_left;
+    uint8_t local_right = signal_right;
+    flag_turn_signal = 0;
+    __enable_irq();
+    
+    CAN_Send_TurnSignal(local_left, local_right);
+    printf("[EVENT] CAN 0x125: Left=%d, Right=%d\r\n", local_left, local_right);
+}
 
+void Process_Sensors(void) {
+    flag_cycle_50ms = 0;
+
+    static float ema_speed = 0.0f;
+    static float ema_rpm   = 1000.0f;
+    static uint8_t  real_speed  = 0;
+    static uint16_t real_rpm    = 0;
+    static uint8_t  log_counter = 0;
+
+    const float alpha_speed = 0.20f; 
+    const float alpha_rpm   = 0.25f; 
+
+    uint16_t adc0 = adc_buffer[0];
+    uint16_t adc1 = adc_buffer[1];
+
+    float current_raw_speed = (float)((adc0 * 240UL) / 4095);
+    float current_raw_rpm   = (float)((adc1 * 8000UL) / 4095);
+    
+    ema_speed = (alpha_speed * current_raw_speed) + ((1.0f - alpha_speed) * ema_speed);
+    ema_rpm   = (alpha_rpm * current_raw_rpm) + ((1.0f - alpha_rpm) * ema_rpm);
+
+    uint8_t next_speed = (uint8_t)ema_speed;
+    uint16_t next_rpm  = (uint16_t)ema_rpm;
+
+    if (abs(next_speed - real_speed) >= 1) {
+        real_speed = next_speed;
+    }
+    if (abs(next_rpm - real_rpm) >= 15) { 
+        real_rpm = next_rpm;
+    }
+
+    CAN_Send_Speed(real_speed);
+    CAN_Send_RPM(real_rpm);
+
+    log_counter++;
+    if (log_counter >= 10) {
+        log_counter = 0;
+        printf("[SENSOR] Speed: %3d km/h | RPM: %4d | CAN Status: %d\r\n",
+               real_speed, real_rpm, can_transmit_result);
+    }
+}
+
+int main(void) {
     Hardware_GPIO_Config();
     UART_Config();
     SysTick_Init();
@@ -300,61 +329,12 @@ int main(void) {
     printf("[BOOT] STM32 IVI ECU started. CAN 500kbps PB8/PB9.\r\n");
 
     while (1) {
-     
-        if (flag_turn == 1) {
-            __disable_irq();
-            uint8_t local_left  = turn_left;
-            uint8_t local_right = turn_right;
-            flag_turn = 0;
-            __enable_irq();
-            
-   
-            CAN_Send_TurnSignal(local_left, local_right);
-            printf("[EVENT] CAN 0x125: Left=%d, Right=%d\r\n", local_left, local_right);
+        if (flag_turn_signal == 1) {
+            Process_Turn_Signal();
         }
 
-if (flag_50ms == 1) {
-            flag_50ms = 0;
-
-           
-            uint16_t adc0 = ADC_Values[0];
-            uint16_t adc1 = ADC_Values[1];
-
-          
-            float current_raw_speed = (float)((adc0 * 240UL) / 4095);
-            float current_raw_rpm   = (float)((adc1 * 8000UL) / 4095);
-            
-       
-            static float ema_speed = 0.0f;
-            static float ema_rpm   = 1000.0f;
-            const float alpha_speed = 0.20f; 
-            const float alpha_rpm   = 0.25f; 
-            
-            ema_speed = (alpha_speed * current_raw_speed) + ((1.0f - alpha_speed) * ema_speed);
-            ema_rpm   = (alpha_rpm * current_raw_rpm) + ((1.0f - alpha_rpm) * ema_rpm);
-
-            // �p v? ki?u s? nguy�n
-            uint8_t next_speed = (uint8_t)ema_speed;
-            uint16_t next_rpm = (uint16_t)ema_rpm;
-
-
-            if (abs(next_speed - real_speed) >= 1) {
-                real_speed = next_speed;
-            }
-            if (abs(next_rpm - real_rpm) >= 15) { 
-                real_rpm = next_rpm;
-            }
-
-         
-            CAN_Send_Speed(real_speed);
-            CAN_Send_RPM(real_rpm);
-
-            print_counter++;
-            if (print_counter >= 10) {
-                print_counter = 0;
-                printf("[SENSOR] Speed: %3d km/h | RPM: %4d | CAN Status: %d\r\n",
-                       real_speed, real_rpm, can_tx_status);
-            }
+        if (flag_cycle_50ms == 1) {
+            Process_Sensors();
         }
     }
 }
