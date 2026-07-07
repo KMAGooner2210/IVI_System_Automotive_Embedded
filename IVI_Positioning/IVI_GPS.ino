@@ -15,7 +15,7 @@ const uint32_t GPS_BAUD   = 38400;
 #define DEBUG_RAW_NMEA   0   
 #define DEBUG_GPS_STATS  1   
 
-/* Khởi tạo các đối tượng ngoại vi và truyền thông */
+
 TinyGPSPlus    gps;
 HardwareSerial gps_serial(1);
 WiFiUDP        udp_sender;
@@ -29,10 +29,10 @@ void setup() {
   delay(2000);
   Serial.println("[BOOT] ESP32-S3 GPS Node starting...");
 
-  /* Khởi tạo cổng Serial cứng cho GPS */
+ 
   gps_serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
-  /* Khởi tạo kết nối mạng WiFi */
+
   WiFi.begin(wifi_ssid, wifi_password);
   Serial.print("[WiFi] Connecting");
   int wifi_retry_count = 0;
@@ -51,9 +51,7 @@ void setup() {
   Serial.println("[GPS] Waiting for satellite fix...");
 }
 
-/* ==========================================
-   CÁC HÀM XỬ LÝ CHỨC NĂNG ĐƯỢC ĐÓNG GÓI MỚI
-   ========================================== */
+
 
 /**
  * @brief Đọc luồng dữ liệu byte từ GPS Serial và giải mã NMEA
